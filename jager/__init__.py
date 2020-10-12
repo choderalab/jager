@@ -4,7 +4,7 @@ JAx Graph lEaRn
 """
 
 # Add imports here
-from .jager import *
+from . import sparse
 
 # Handle versioneer
 from ._version import get_versions
