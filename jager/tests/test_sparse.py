@@ -45,4 +45,4 @@ def test_init_dense_indices_agree():
     )
 
 
-    assert x_0 == x_1
+    assert jnp.all(x_0 == x_1)

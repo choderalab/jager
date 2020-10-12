@@ -27,7 +27,7 @@ class SparseMatrix2D(SparseMatrix):
 
     def to_dense(self):
         dense = jnp.zeros(self.shape, self.dtype)
-        return dense.at[tuple(self.index)].add(self.data)
+        return dense.at[self.index].add(self.data)
 
     @classmethod
     def from_dense(cls, x):
