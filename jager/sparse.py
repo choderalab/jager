@@ -27,13 +27,17 @@ class SparseMatrix2D(SparseMatrix):
 
     def to_dense(self):
         dense = jnp.zeros(self.shape, self.dtype)
-        return dense.at[self.index].add(self.data)
+        return dense.at[tuple(self.index)].add(self.data)
 
     @classmethod
     def from_dense(cls, x):
         x = jnp.asarray(x)
         nz = (x != 0)
         return cls(jnp.where(nz), x[nz], x.shape)
+
+    @property
+    def nnz(self):
+        return self.data.shape[0]
 
     @property
     def dtype(self):
@@ -47,24 +51,31 @@ class SparseMatrix2D(SparseMatrix):
     def ndim(self):
         return len(self._shape)
 
-    # @jax.jit
-    def __matmul__(self, x):
-        if not self.ndim == 2 and x.ndim == 2:
-            raise NotImplementedError
-
-        assert self.shape[1] == x.shape[0]
-
+    @staticmethod
+    @partial(jax.jit, static_argnums=(3,))
+    def _matmul(x, index, data, num_segments):
         # (n_entries, )
-        rows = self.index[0, :]
-        cols = self.index[1, :]
+        rows = index[0, :]
+        cols = index[1, :]
 
         # (n_entries, x_shape[1])
         in_ = x.take(cols, axis=0)
 
         # data: shape=(n_entries)
-        prod = in_ * self.data[:, None]
+        prod = in_ * jax.lax.broadcast(data, in_.shape[1:][::-1]).transpose(
+            list(range(len(in_.shape)))[::-1]
+        )
 
-        return jax.ops.segment_sum(prod, rows, self.shape[0])
+        return jax.ops.segment_sum(prod, rows, num_segments)
+
+    @jax.jit
+    def __matmul__(self, x):
+        if not self.ndim == 2:
+            raise NotImplementedError
+
+        assert self.shape[1] == x.shape[0]
+
+        return self._matmul(x, self.index, self.data, self.shape[0])
 
     def __repr__(self):
         return 'Sparse Matrix with shape=%s, indices=%s, and data=%s' % (
@@ -78,3 +89,18 @@ class SparseMatrix2D(SparseMatrix):
             return False
         else:
             return self.to_dense() == x.to_dense()
+
+# =============================================================================
+# REGISTER WITH JAX
+# =============================================================================
+def _flatten_SparseMatrix2D(x):
+    return x.index, x.data, x.shape
+
+def _unflatten_SparseMatrix2D(index, data, shape):
+    return SparseMatrix2D(index=index, data=data, shape=shape)
+
+jax.tree_util.register_pytree_node(
+    SparseMatrix2D,
+    _flatten_SparseMatrix2D,
+    _unflatten_SparseMatrix2D
+)
