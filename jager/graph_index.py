@@ -1,24 +1,9 @@
 """Module for graph index class definition."""
-from __future__ import absolute_import
 
-import numpy as np
-import networkx as nx
-import scipy
+import jax
+from jax import numpy as jnp
 
-from ._ffi.object import register_object, ObjectBase
-from ._ffi.function import _init_api
-from .base import DGLError, dgl_warning
-from . import backend as F
-from . import utils
-
-class BoolFlag(object):
-    """Bool flag with unknown value"""
-    BOOL_UNKNOWN = -1
-    BOOL_FALSE = 0
-    BOOL_TRUE = 1
-
-@register_object('graph.Graph')
-class GraphIndex(ObjectBase):
+class GraphIndex(object):
     """Graph index object.
 
     Note
@@ -34,10 +19,9 @@ class GraphIndex(ObjectBase):
     - `dgl.graph_index.from_coo`
     """
     def __new__(cls):
-        obj = ObjectBase.__new__(cls)
-        obj._readonly = None  # python-side cache of the flag
-        obj._cache = {}
-        return obj
+        cls._readonly = None  # python-side cache of the flag
+        cls._cache = {}
+        return super(GraphIndex, cls).__new__(cls)
 
     def __getstate__(self):
         src, dst, _ = self.edges()
@@ -50,25 +34,15 @@ class GraphIndex(ObjectBase):
         """The pickle state of GraphIndex is defined as a triplet
         (number_of_nodes, readonly, src_nodes, dst_nodes)
         """
-        # Pickle compatibility check
-        # TODO: we should store a storage version number in later releases.
-        if isinstance(state, tuple) and len(state) == 5:
-            dgl_warning("The object is pickled pre-0.4.2.  Multigraph flag is ignored in 0.4.3")
-            num_nodes, _, readonly, src, dst = state
-        elif isinstance(state, tuple) and len(state) == 4:
-            # post-0.4.3.
-            num_nodes, readonly, src, dst = state
-        else:
-            raise IOError('Unrecognized storage format.')
+
+        num_nodes, readonly, src, dst = state
 
         self._cache = {}
         self._readonly = readonly
-        self.__init_handle_by_constructor__(
-            _CAPI_DGLGraphCreate,
-            src.todgltensor(),
-            dst.todgltensor(),
-            int(num_nodes),
-            readonly)
+        self.num_nodes = int(num_nodes)
+        self.readonly = readonly
+        self.src = src
+        self.dst = dst
 
     def add_nodes(self, num):
         """Add nodes.
@@ -78,8 +52,7 @@ class GraphIndex(ObjectBase):
         num : int
             Number of nodes to be added.
         """
-        _CAPI_DGLGraphAddVertices(self, int(num))
-        self.clear_cache()
+        self.num_nodes += num
 
     def add_edge(self, u, v):
         """Add one edge.
@@ -91,8 +64,8 @@ class GraphIndex(ObjectBase):
         v : int
             The dst node.
         """
-        _CAPI_DGLGraphAddEdge(self, int(u), int(v))
-        self.clear_cache()
+        self.src.append(u)
+        self.dst.append(v)
 
     def add_edges(self, u, v):
         """Add many edges.
@@ -104,19 +77,16 @@ class GraphIndex(ObjectBase):
         v : utils.Index
             The dst nodes.
         """
-        u_array = u.todgltensor()
-        v_array = v.todgltensor()
-        _CAPI_DGLGraphAddEdges(self, u_array, v_array)
-        self.clear_cache()
+        self.src += list(u)
+        self.dst += list(v)
 
     def clear(self):
         """Clear the graph."""
-        _CAPI_DGLGraphClear(self)
-        self.clear_cache()
+        pass
 
     def clear_cache(self):
         """Clear the cached graph structures."""
-        self._cache.clear()
+        pass
 
     def is_multigraph(self):
         """Return whether the graph is a multigraph
@@ -137,8 +107,6 @@ class GraphIndex(ObjectBase):
         bool
             True if it is a read-only graph, False otherwise.
         """
-        if self._readonly is None:
-            self._readonly = bool(_CAPI_DGLGraphIsReadonly(self))
         return self._readonly
 
     def readonly(self, readonly_state=True):
@@ -151,7 +119,6 @@ class GraphIndex(ObjectBase):
         """
         # TODO(minjie): very ugly code, should fix this
         n_nodes, _, src, dst = self.__getstate__()
-        self.clear_cache()
         state = (n_nodes, readonly_state, src, dst)
         self.__setstate__(state)
 
@@ -163,7 +130,7 @@ class GraphIndex(ObjectBase):
         int
             The number of nodes
         """
-        return _CAPI_DGLGraphNumVertices(self)
+        return self.num_nodes
 
     def number_of_edges(self):
         """Return the number of edges.
@@ -173,7 +140,7 @@ class GraphIndex(ObjectBase):
         int
             The number of edges
         """
-        return _CAPI_DGLGraphNumEdges(self)
+        return len(self.src)
 
     def has_node(self, vid):
         """Return true if the node exists.
@@ -188,7 +155,7 @@ class GraphIndex(ObjectBase):
         bool
             True if the node exists, False otherwise.
         """
-        return bool(_CAPI_DGLGraphHasVertex(self, int(vid)))
+        return vid < self.num_nodes
 
     def has_nodes(self, vids):
         """Return true if the nodes exist.
@@ -203,8 +170,20 @@ class GraphIndex(ObjectBase):
         utils.Index
             0-1 array indicating existence
         """
-        vid_array = vids.todgltensor()
-        return utils.toindex(_CAPI_DGLGraphHasVertices(self, vid_array))
+        vids = jnp.assarray(vids)
+        return 1 * (vids < self.num_nodes)
+
+    @staticmethod
+    def _has_edge_between(src, dst, u, v):
+        # find the matches
+        u_match_src = (u == src)
+        v_match_dst = (v == dst)
+
+        return jnp.any(
+            jnp.logical_and(
+                u_match_src, v_match_dst,
+            )
+        )
 
     def has_edge_between(self, u, v):
         """Return true if the edge exists.
@@ -221,7 +200,11 @@ class GraphIndex(ObjectBase):
         bool
             True if the edge exists, False otherwise
         """
-        return bool(_CAPI_DGLGraphHasEdgeBetween(self, int(u), int(v)))
+        # put src and dst in arrays
+        src = jnp.asarray(self.src)
+        dst = jnp.asarray(self.dst)
+
+        return self._has_edge_between(src, dst, u, v)
 
     def has_edges_between(self, u, v):
         """Return true if the edge exists.
@@ -238,9 +221,18 @@ class GraphIndex(ObjectBase):
         utils.Index
             0-1 array indicating existence
         """
-        u_array = u.todgltensor()
-        v_array = v.todgltensor()
-        return utils.toindex(_CAPI_DGLGraphHasEdgesBetween(self, u_array, v_array))
+        # put src and dst in arrays
+        src = jnp.asarray(self.src)
+        dst = jnp.asarray(self.dst)
+
+        # put u and v into arrays
+        u_array = jnp.asarray(u)
+        v_array = jnp.asarray(v)
+
+        return 1 * jax.vmap(
+            self.has_edge_between,
+            (None, None, 0, 0,),
+        )(src, dst, u_array, v_array)
 
     def predecessors(self, v, radius=1):
         """Return the predecessors of the node.
@@ -257,8 +249,7 @@ class GraphIndex(ObjectBase):
         utils.Index
             Array of predecessors
         """
-        return utils.toindex(_CAPI_DGLGraphPredecessors(
-            self, int(v), int(radius)))
+        raise NotImplementedError
 
     def successors(self, v, radius=1):
         """Return the successors of the node.
